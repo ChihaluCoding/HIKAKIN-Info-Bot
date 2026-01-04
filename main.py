@@ -9,12 +9,10 @@ import os
 import re
 import ssl
 import tempfile
-import threading
 import time
 from collections import deque
 from dataclasses import dataclass
-from datetime import datetime, timezone
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Deque, Dict, List, Optional, Set, Tuple
 
@@ -25,6 +23,9 @@ import tweepy
 
 # Xの最大文字数を定数として定義するコメント
 MAX_TWEET_LENGTH = 280
+
+# 投稿に付与するハッシュタグを定義するコメント
+POST_HASHTAG = "#ヒカキン"
 
 # Xの返信設定で許可する値を定義するコメント
 X_REPLY_SETTINGS = {"everyone", "mentionedUsers", "following"}
@@ -57,6 +58,12 @@ YOUTUBE_VIDEOS_ENDPOINT = "https://www.googleapis.com/youtube/v3/videos"
 # YouTube配信予定のキャッシュファイル名を定義するコメント
 YOUTUBE_UPCOMING_CACHE_FILENAME = "youtube_upcoming_cache.json"
 
+# 配信履歴のキャッシュファイル名を定義するコメント
+STREAM_HISTORY_CACHE_FILENAME = "twitch_stream_history.json"
+
+# 月次配信統計のキャッシュファイル名を定義するコメント
+MONTHLY_STATS_CACHE_FILENAME = "monthly_stats_cache.json"
+
 # 日本語フォントのファイル名を定義するコメント
 JAPANESE_FONT_FILE = "NotoSansCJKjp-Regular.otf"
 
@@ -69,23 +76,9 @@ TARGET_TWITCH_USER = "hikakin"
 # 大文字小文字の差を吸収するために小文字化するコメント
 TARGET_TWITCH_USER_LOWER = TARGET_TWITCH_USER.lower()
 
-# 表示用の投稿対象ユーザー名を用意するコメント
-TARGET_TWITCH_USER_DISPLAY = f"{TARGET_TWITCH_USER.upper()} / {TARGET_TWITCH_USER_LOWER}"
-
 # 投稿時の見出しを固定するコメント
-POST_HEADER = "「新着コメント😎」"
+POST_HEADER = "【新着コメント😎】"
 
-# 起動時投稿のメッセージを定義するコメント
-STARTUP_POST_MESSAGE = "botを起動しました"
-
-# 稼働状況APIのホストを固定するコメント
-STATUS_SERVER_HOST = "127.0.0.1"
-
-# 稼働状況APIのポートを固定するコメント
-STATUS_SERVER_PORT = 8080
-
-# 稼働状況の文字数上限を設定するコメント
-STATUS_TEXT_LIMIT = 200
 
 # トークン更新時の安全マージンに関するコメント
 TOKEN_REFRESH_MARGIN_SECONDS = 60.0
@@ -207,6 +200,8 @@ class YouTubeStreamInfo:
     viewer_count: int
     # 配信タイトルを保持するコメント
     title: str
+    # チャンネル名を保持するコメント
+    channel_title: str
 
 
 # YouTube配信予定情報を保持するデータクラスに関するコメント
@@ -237,6 +232,8 @@ class YouTubeChannelSession:
     video_id: str
     # 配信タイトルを保持するコメント
     title: str
+    # チャンネル名を保持するコメント
+    channel_title: str
     # 配信開始時刻のUNIX秒を保持するコメント
     started_at: float
     # 同接サンプルの一覧を保持するコメント
@@ -472,16 +469,6 @@ def clip_text(text: str, limit: int) -> str:
 
 
 
-# UNIX時刻をISO文字列に変換する関数に関するコメント
-def format_iso_time(timestamp: Optional[float]) -> Optional[str]:
-    """UNIX時刻をISO 8601形式に変換する。"""
-
-    # 未設定の場合はNoneを返すコメント
-    if timestamp is None:
-        return None
-    return datetime.fromtimestamp(timestamp, tz=timezone.utc).isoformat()
-
-
 # ISO時刻をUNIX秒に変換する関数に関するコメント
 def parse_iso_datetime(value: Optional[str]) -> Optional[float]:
     """ISO 8601形式の時刻文字列をUNIX秒に変換する。"""
@@ -514,6 +501,57 @@ def format_month_day(timestamp: float) -> str:
     # 月日を取り出して整形するコメント
     date_value = datetime.fromtimestamp(timestamp)
     return f"{date_value.month}月{date_value.day}日"
+
+
+# 符号付き整数を整形する関数に関するコメント
+def format_signed_int(value: int) -> str:
+    """符号付きの整数を +N / -N 形式で返す。"""
+
+    # 符号を判定するコメント
+    sign = "+" if value >= 0 else "-"
+    return f"{sign}{abs(value)}"
+
+
+# 符号付きの時間差を整形する関数に関するコメント
+def format_signed_duration(seconds: float) -> str:
+    """符号付きの時間差をX時間Y分で返す。"""
+
+    # 絶対値の分数を求めるコメント
+    total_minutes = int(round(abs(seconds) / 60))
+    hours, minutes = divmod(total_minutes, 60)
+
+    # 符号を判定するコメント
+    sign = "+" if seconds >= 0 else "-"
+    return f"{sign}{hours}時間{minutes}分"
+
+
+# 月次配信統計の投稿文を構築する関数に関するコメント
+def build_monthly_stats_tweet(
+    start_timestamp: float,
+    end_timestamp: float,
+    total_days: int,
+    total_seconds: float,
+    diff_days: int,
+    diff_seconds: float,
+) -> str:
+    """月次配信統計の投稿文を作る。"""
+
+    # 期間の表示を作るコメント
+    start_label = format_month_day(start_timestamp)
+    end_label = format_month_day(max(0.0, end_timestamp - 1))
+
+    # 総配信時間を時間と分に変換するコメント
+    total_minutes = int(round(total_seconds / 60))
+    hours, minutes = divmod(total_minutes, 60)
+
+    # 投稿文を組み立てるコメント
+    message = (
+        "【配信統計📊】\n\n"
+        f"{start_label}〜{end_label}\n\n"
+        f"配信日数：{total_days}日（先月比 {format_signed_int(diff_days)}）\n"
+        f"総配信時間：{hours}時間{minutes}分（先月比 {format_signed_duration(diff_seconds)}）"
+    )
+    return truncate_for_x(message, MAX_TWEET_LENGTH)
 
 
 # 同接の最大と平均を計算する関数に関するコメント
@@ -594,213 +632,6 @@ def setup_matplotlib_japanese_font() -> object:
     matplotlib.rcParams["axes.unicode_minus"] = False
 
     return font_prop
-
-
-# 稼働状況を保持するクラスに関するコメント
-class BotStatus:
-    """稼働状況をスレッドセーフに管理するクラス。"""
-
-    # 初期化処理に関するコメント
-    def __init__(self, twitch_channel: str, target_user: str) -> None:
-        # 状態を保護するロックを用意するコメント
-        self._lock = threading.Lock()
-
-        # 初期状態を保持するコメント
-        now = time.time()
-        self._started_at = now
-        self._status = "starting"
-        self._status_message = "起動中"
-        self._status_updated_at = now
-        self._twitch_channel = twitch_channel
-        self._target_user = target_user
-        self._last_comment_at: Optional[float] = None
-        self._last_comment_user: Optional[str] = None
-        self._last_comment_text: Optional[str] = None
-        self._last_post_at: Optional[float] = None
-        self._last_post_text: Optional[str] = None
-        self._last_error_at: Optional[float] = None
-        self._last_error_message: Optional[str] = None
-
-    # ステータスを更新する処理に関するコメント
-    def set_status(self, status: str, message: str) -> None:
-        """稼働状態とメッセージを更新する。"""
-
-        # 状態の更新をロック内で行うコメント
-        with self._lock:
-            now = time.time()
-            self._status = status
-            self._status_message = clip_text(message, STATUS_TEXT_LIMIT)
-            self._status_updated_at = now
-
-    # コメント受信を記録する処理に関するコメント
-    def record_comment(self, user: str, message: str) -> None:
-        """最新コメント情報を更新する。"""
-
-        # コメント情報をロック内で更新するコメント
-        with self._lock:
-            now = time.time()
-            self._last_comment_at = now
-            self._last_comment_user = user
-            self._last_comment_text = clip_text(message, STATUS_TEXT_LIMIT)
-            self._status = "running"
-            self._status_message = "コメント監視中"
-            self._status_updated_at = now
-
-    # 投稿完了を記録する処理に関するコメント
-    def record_post(self, message: str) -> None:
-        """最新投稿情報を更新する。"""
-
-        # 投稿情報をロック内で更新するコメント
-        with self._lock:
-            now = time.time()
-            self._last_post_at = now
-            self._last_post_text = clip_text(message, STATUS_TEXT_LIMIT)
-            self._status = "running"
-            self._status_message = "Xへ投稿済み"
-            self._status_updated_at = now
-
-    # エラーを記録する処理に関するコメント
-    def record_error(self, message: str) -> None:
-        """最新エラー情報を更新する。"""
-
-        # エラー情報をロック内で更新するコメント
-        with self._lock:
-            now = time.time()
-            self._last_error_at = now
-            self._last_error_message = clip_text(message, STATUS_TEXT_LIMIT)
-            self._status = "warning"
-            self._status_message = "エラー発生"
-            self._status_updated_at = now
-
-    # 現在の状態をスナップショット化する処理に関するコメント
-    def snapshot(self) -> dict:
-        """フロント表示用の状態情報を返す。"""
-
-        # 状態のコピーを作成するコメント
-        with self._lock:
-            now = time.time()
-            return {
-                "data_source": "local-api",
-                "status": self._status,
-                "status_message": self._status_message,
-                "status_updated_at": self._status_updated_at,
-                "status_updated_at_iso": format_iso_time(self._status_updated_at),
-                "started_at": self._started_at,
-                "started_at_iso": format_iso_time(self._started_at),
-                "uptime_seconds": max(0.0, now - self._started_at),
-                "twitch_channel": self._twitch_channel,
-                "target_user": self._target_user,
-                "last_comment_at": self._last_comment_at,
-                "last_comment_at_iso": format_iso_time(self._last_comment_at),
-                "last_comment_user": self._last_comment_user,
-                "last_comment_text": self._last_comment_text,
-                "last_post_at": self._last_post_at,
-                "last_post_at_iso": format_iso_time(self._last_post_at),
-                "last_post_text": self._last_post_text,
-                "last_error_at": self._last_error_at,
-                "last_error_at_iso": format_iso_time(self._last_error_at),
-                "last_error_message": self._last_error_message,
-            }
-
-
-# 稼働状況APIのリクエストハンドラに関するコメント
-class StatusRequestHandler(BaseHTTPRequestHandler):
-    """稼働状況APIへのリクエストを処理する。"""
-
-    # GETリクエストを処理するコメント
-    def do_GET(self) -> None:
-        """GETリクエストを処理してJSONを返す。"""
-
-        # 対象パス以外は404を返すコメント
-        if self.path.split("?", 1)[0] != "/status":
-            self.send_response(404)
-            self.send_header("Content-Type", "text/plain; charset=utf-8")
-            self.end_headers()
-            self.wfile.write("Not Found".encode("utf-8"))
-            return
-
-        # ステータス情報を取得してJSON化するコメント
-        payload = self.server.status_provider.snapshot()
-        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-
-        # レスポンスヘッダーを設定するコメント
-        self.send_response(200)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Cache-Control", "no-store")
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-
-        # レスポンスボディを送るコメント
-        self.wfile.write(body)
-
-    # ログを抑制して統一ログにするコメント
-    def log_message(self, format_string: str, *args: object) -> None:
-        """標準出力ログを抑制する。"""
-
-        # 未使用引数の警告を避けるコメント
-        _ = format_string
-        _ = args
-        return
-
-
-# ステータスAPI用のHTTPサーバークラスに関するコメント
-class StatusHTTPServer(ThreadingHTTPServer):
-    """ステータスAPIのHTTPサーバーを提供する。"""
-
-    # 初期化処理に関するコメント
-    def __init__(self, server_address: Tuple[str, int], status_provider: BotStatus) -> None:
-        # ステータスプロバイダを保持するコメント
-        self.status_provider = status_provider
-        super().__init__(server_address, StatusRequestHandler)
-
-
-# ステータスAPIサーバーを管理するクラスに関するコメント
-class StatusServerController:
-    """ステータスAPIの起動と停止を管理する。"""
-
-    # 初期化処理に関するコメント
-    def __init__(self, status_provider: BotStatus) -> None:
-        # サーバーとスレッドを保持するコメント
-        self._status_provider = status_provider
-        self._server: Optional[StatusHTTPServer] = None
-        self._thread: Optional[threading.Thread] = None
-
-    # サーバーを起動するコメント
-    def start(self) -> None:
-        """ローカルHTTPサーバーを起動する。"""
-
-        # サーバーの重複起動を避けるコメント
-        if self._server is not None:
-            return
-
-        # サーバーを作成してスレッドで起動するコメント
-        self._server = StatusHTTPServer((STATUS_SERVER_HOST, STATUS_SERVER_PORT), self._status_provider)
-        self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
-        self._thread.start()
-        LOGGER.info(
-            "ステータスAPIを起動しました: http://%s:%s/status",
-            STATUS_SERVER_HOST,
-            STATUS_SERVER_PORT,
-        )
-
-    # サーバーを停止するコメント
-    def stop(self) -> None:
-        """ローカルHTTPサーバーを停止する。"""
-
-        # サーバーが未起動なら何もしないコメント
-        if self._server is None:
-            return
-
-        # サーバー停止処理を行うコメント
-        self._server.shutdown()
-        self._server.server_close()
-        self._server = None
-
-        # スレッドの終了を待機するコメント
-        if self._thread is not None:
-            self._thread.join(timeout=3.0)
-            self._thread = None
 
 
 # Twitchトークンを管理するクラスに関するコメント
@@ -1016,15 +847,18 @@ async def fetch_youtube_stream_info(
     if started_at is None:
         started_at = time.time()
 
-    # 配信タイトルを取り出すコメント
+    # 配信タイトルとチャンネル名を取り出すコメント
     title_value = snippet.get("title")
+    channel_title_value = snippet.get("channelTitle")
     title_text = title_value.strip() if isinstance(title_value, str) else ""
+    channel_title = channel_title_value.strip() if isinstance(channel_title_value, str) else ""
 
     return YouTubeStreamInfo(
         video_id=video_id,
         started_at=started_at,
         viewer_count=viewer_count_int,
         title=title_text,
+        channel_title=channel_title,
     )
 
 
@@ -1242,12 +1076,34 @@ def truncate_for_x(text: str, max_length: int) -> str:
     return f"{text[: max_length - 3]}..."
 
 
+# ハッシュタグを末尾に追加する関数に関するコメント
+def append_hashtag(text: str, hashtag: str, max_length: int) -> str:
+    """指定したハッシュタグを投稿文末尾に追加する。"""
+
+    # 既に含まれている場合はそのまま返すコメント
+    if hashtag in text:
+        return text
+
+    # 追加する末尾の文字列を作るコメント
+    suffix = f"\n\n{hashtag}"
+    if len(text) + len(suffix) <= max_length:
+        return f"{text}{suffix}"
+
+    # 末尾が入るように本文を切り詰めるコメント
+    available_length = max_length - len(suffix)
+    if available_length <= 0:
+        return truncate_for_x(hashtag, max_length)
+
+    trimmed_text = truncate_for_x(text, available_length)
+    return f"{trimmed_text}{suffix}"
+
+
 # ツイート本文を構築する関数に関するコメント
 def build_tweet(message: str) -> str:
     """投稿用のテキストを組み立てる。"""
 
     # 指定フォーマットで本文を構成するコメント
-    base_text = f"{POST_HEADER}\n\n「{message}」"
+    base_text = f"{POST_HEADER}\n\n{message}"
     return truncate_for_x(base_text, MAX_TWEET_LENGTH)
 
 
@@ -1289,21 +1145,24 @@ def build_stream_summary_tweet(session: StreamSession, ended_at: float) -> str:
 
     # 投稿文を組み立てるコメント
     summary_lines = [
-        f"{header_date} 同接推移",
+        f"【{header_date} 同接推移📈】",
         "",
         "Twitch",
-        f"最大同接者数：{twitch_max}人",
+        f"最大同時接続者数：{twitch_max}人",
         f"平均同時接続者数：{twitch_avg}人",
     ]
 
     # YouTubeの統計値を追加するコメント
     if youtube_counts:
+        total_max = twitch_max + youtube_max
         summary_lines.extend(
             [
                 "",
                 "YouTube",
-                f"最大同接者数：{youtube_max}人",
+                f"最大同時接続者数：{youtube_max}人",
                 f"平均同時接続者数：{youtube_avg}人",
+                "",
+                f"最大同時接続者数（総計）：{total_max}人",
             ]
         )
 
@@ -1323,9 +1182,9 @@ def build_youtube_upcoming_tweet(info: YouTubeUpcomingInfo, now: float) -> str:
 
     # 告知文を組み立てるコメント
     message = (
-        f"{time_text}に{channel_text}の配信が始まります\n"
+        f"【🔴{time_text}に{channel_text}の配信が始まります】\n\n"
         f"開始予定: {scheduled_text}\n"
-        f"タイトル: {title_text}\n"
+        f"タイトル: {title_text}\n\n"
         f"{info.url}"
     )
     return truncate_for_x(message, MAX_TWEET_LENGTH)
@@ -1337,6 +1196,7 @@ def generate_viewer_graph(
     output_path: str,
     title: str,
     youtube_series: Optional[List[Tuple[str, Deque[ViewerSample]]]] = None,
+    twitch_label: str = "Twitch",
 ) -> None:
     """同接推移のPNGグラフを生成する。"""
 
@@ -1376,7 +1236,8 @@ def generate_viewer_graph(
     if has_twitch_samples:
         times = [datetime.fromtimestamp(sample.timestamp) for sample in samples]
         counts = [sample.viewer_count for sample in samples]
-        ax.plot(times, counts, color="#e56b6f", linewidth=2, label="Twitch")
+        label_text = twitch_label if twitch_label else "Twitch"
+        ax.plot(times, counts, color="#e56b6f", linewidth=2, label=label_text)
         ax.fill_between(times, counts, color="#e56b6f", alpha=0.18)
 
     # YouTubeの系列を描画するコメント
@@ -1441,7 +1302,6 @@ class XPoster:
         media_client: tweepy.API,
         interval_seconds: float,
         queue_size: int,
-        status: BotStatus,
         reply_setting: str,
         reply_mentions: Tuple[str, ...],
     ) -> None:
@@ -1452,7 +1312,6 @@ class XPoster:
         self._queue: asyncio.Queue[Optional[XPostJob]] = asyncio.Queue(maxsize=queue_size)
         self._task: Optional[asyncio.Task[None]] = None
         self._last_post_time = 0.0
-        self._status = status
         self._reply_setting = reply_setting
         self._reply_mentions = reply_mentions
 
@@ -1523,6 +1382,8 @@ class XPoster:
             post_text = job.text
             if self._reply_setting == "mentionedUsers":
                 post_text = apply_reply_mentions(post_text, self._reply_mentions)
+            # ハッシュタグを付けるコメント
+            post_text = append_hashtag(post_text, POST_HASHTAG, MAX_TWEET_LENGTH)
 
             if job.media_path:
                 # メディアをアップロードするコメント
@@ -1542,10 +1403,8 @@ class XPoster:
                     reply_settings=self._reply_setting,
                 )
             self._last_post_time = time.monotonic()
-            self._status.record_post(post_text)
             LOGGER.info("Xに投稿しました。")
         except Exception as exc:
-            self._status.record_error(f"X投稿失敗: {exc}")
             LOGGER.exception("Xへの投稿に失敗しました: %s", exc)
         finally:
             # 後始末が必要なファイルを削除するコメント
@@ -1618,14 +1477,12 @@ class TwitchIRCListener:
         poster: XPoster,
         token_manager: TwitchTokenManager,
         nick: str,
-        status: BotStatus,
     ) -> None:
         # 設定値とポスターを保持するコメント
         self._settings = settings
         self._poster = poster
         self._token_manager = token_manager
         self._nick = nick
-        self._status = status
         self._stop_event = asyncio.Event()
 
     # 停止指示を出すためのコメント
@@ -1647,7 +1504,6 @@ class TwitchIRCListener:
                 # キャンセル時はそのまま伝播させるコメント
                 raise
             except Exception as exc:
-                self._status.record_error(f"Twitch接続エラー: {exc}")
                 LOGGER.exception("Twitch接続中に例外が発生しました: %s", exc)
 
             # 再接続まで待機するコメント
@@ -1687,13 +1543,11 @@ class TwitchIRCListener:
 
             # 接続完了ログを出すコメント
             LOGGER.info("認証モードでTwitchコメント監視を開始します。ログイン名: %s", nick)
-            self._status.set_status("running", "Twitch IRC接続中")
 
             # 受信ループに関するコメント
             while not self._stop_event.is_set():
                 raw_line = await reader.readline()
                 if not raw_line:
-                    self._status.record_error("Twitch IRCの接続が切断されました。")
                     LOGGER.info("Twitch IRCの接続が切断されました。")
                     return
 
@@ -1734,9 +1588,6 @@ class TwitchIRCListener:
         if not content:
             return
 
-        # コメント受信を記録するコメント
-        self._status.record_comment(author, content)
-
         # 投稿文を組み立ててキューに追加するコメント
         tweet_text = build_tweet(content)
         await self._poster.enqueue_text(tweet_text)
@@ -1761,13 +1612,11 @@ class TwitchStreamMonitor:
         settings: Settings,
         poster: XPoster,
         token_manager: TwitchTokenManager,
-        status: BotStatus,
     ) -> None:
         # 設定と依存関係を保持するコメント
         self._settings = settings
         self._poster = poster
         self._token_manager = token_manager
-        self._status = status
         self._stop_event = asyncio.Event()
         self._task: Optional[asyncio.Task[None]] = None
         self._lock = asyncio.Lock()
@@ -1775,6 +1624,8 @@ class TwitchStreamMonitor:
         self._youtube_last_polled_at = 0.0
         self._youtube_upcoming_last_polled_at = 0.0
         self._youtube_upcoming_posted_ids = self._load_youtube_upcoming_cache()
+        self._stream_history = self._load_stream_history_cache()
+        self._monthly_stats_posted = self._load_monthly_stats_cache()
 
     # 監視タスクを開始するコメント
     def start(self) -> None:
@@ -1809,7 +1660,6 @@ class TwitchStreamMonitor:
             try:
                 await self._poll_once()
             except Exception as exc:
-                self._status.record_error(f"Twitch配信監視エラー: {exc}")
                 LOGGER.exception("Twitch配信監視中に例外が発生しました: %s", exc)
             await self._wait_for_next_poll()
 
@@ -1863,6 +1713,104 @@ class TwitchStreamMonitor:
             return set()
         return {item for item in data if isinstance(item, str) and item.strip()}
 
+    # 配信履歴キャッシュを読み込むコメント
+    def _load_stream_history_cache(self) -> List[dict]:
+        """配信履歴のキャッシュを読み込む。"""
+
+        # ファイルパスを組み立てるコメント
+        cache_path = Path(__file__).resolve().parent / STREAM_HISTORY_CACHE_FILENAME
+        if not cache_path.is_file():
+            return []
+
+        # JSONを読み込むコメント
+        try:
+            with cache_path.open("r", encoding="utf-8") as file_handle:
+                data = json.load(file_handle)
+        except (OSError, json.JSONDecodeError):
+            return []
+
+        # リスト以外は無視するコメント
+        if not isinstance(data, list):
+            return []
+
+        # 有効なレコードだけを残すコメント
+        records = []
+        for item in data:
+            if not isinstance(item, dict):
+                continue
+            started_at = item.get("started_at")
+            ended_at = item.get("ended_at")
+            stream_id = item.get("stream_id")
+            if not isinstance(started_at, (int, float)):
+                continue
+            if not isinstance(ended_at, (int, float)):
+                continue
+            if not isinstance(stream_id, str) or not stream_id.strip():
+                continue
+            if ended_at <= started_at:
+                continue
+            records.append(
+                {
+                    "stream_id": stream_id,
+                    "started_at": float(started_at),
+                    "ended_at": float(ended_at),
+                }
+            )
+
+        return records
+
+    # 配信履歴キャッシュを書き込むコメント
+    def _save_stream_history_cache(self) -> None:
+        """配信履歴のキャッシュを書き込む。"""
+
+        # ファイルパスを組み立てるコメント
+        cache_path = Path(__file__).resolve().parent / STREAM_HISTORY_CACHE_FILENAME
+
+        # JSONを書き込むコメント
+        try:
+            with cache_path.open("w", encoding="utf-8") as file_handle:
+                json.dump(self._stream_history, file_handle, ensure_ascii=False, indent=2)
+                file_handle.write("\n")
+        except OSError:
+            LOGGER.warning("配信履歴キャッシュの保存に失敗しました。")
+
+    # 月次投稿のキャッシュを読み込むコメント
+    def _load_monthly_stats_cache(self) -> Set[str]:
+        """月次配信統計の投稿済み月を読み込む。"""
+
+        # ファイルパスを組み立てるコメント
+        cache_path = Path(__file__).resolve().parent / MONTHLY_STATS_CACHE_FILENAME
+        if not cache_path.is_file():
+            return set()
+
+        # JSONを読み込むコメント
+        try:
+            with cache_path.open("r", encoding="utf-8") as file_handle:
+                data = json.load(file_handle)
+        except (OSError, json.JSONDecodeError):
+            return set()
+
+        # リストをセットに変換するコメント
+        if not isinstance(data, list):
+            return set()
+        return {item for item in data if isinstance(item, str) and item.strip()}
+
+    # 月次投稿のキャッシュを書き込むコメント
+    def _save_monthly_stats_cache(self) -> None:
+        """月次配信統計の投稿済み月を保存する。"""
+
+        # ファイルパスを組み立てるコメント
+        cache_path = Path(__file__).resolve().parent / MONTHLY_STATS_CACHE_FILENAME
+        payload = sorted(self._monthly_stats_posted)
+
+        # JSONを書き込むコメント
+        try:
+            with cache_path.open("w", encoding="utf-8") as file_handle:
+                json.dump(payload, file_handle, ensure_ascii=False, indent=2)
+                file_handle.write("\n")
+        except OSError:
+            LOGGER.warning("月次配信統計キャッシュの保存に失敗しました。")
+
     # YouTube配信予定のキャッシュを保存するコメント
     def _save_youtube_upcoming_cache(self) -> None:
         """配信予定の投稿済みIDを保存する。"""
@@ -1912,14 +1860,12 @@ class TwitchStreamMonitor:
         try:
             fetched = await asyncio.gather(*tasks, return_exceptions=True)
         except Exception as exc:
-            self._status.record_error(f"YouTube配信監視エラー: {exc}")
             LOGGER.exception("YouTube配信情報の取得に失敗しました: %s", exc)
             return results
 
         # チャンネルごとの結果を整理するコメント
         for channel_id, result in zip(channel_ids, fetched):
             if isinstance(result, Exception):
-                self._status.record_error(f"YouTube配信監視エラー: {channel_id} {result}")
                 LOGGER.error("YouTube配信情報の取得に失敗しました: %s", result)
                 continue
             if result is None:
@@ -1961,14 +1907,12 @@ class TwitchStreamMonitor:
         try:
             fetched = await asyncio.gather(*tasks, return_exceptions=True)
         except Exception as exc:
-            self._status.record_error(f"YouTube配信予定監視エラー: {exc}")
             LOGGER.exception("YouTube配信予定情報の取得に失敗しました: %s", exc)
             return results
 
         # チャンネルごとの結果を整理するコメント
         for channel_id, result in zip(channel_ids, fetched):
             if isinstance(result, Exception):
-                self._status.record_error(f"YouTube配信予定監視エラー: {channel_id} {result}")
                 LOGGER.error("YouTube配信予定情報の取得に失敗しました: %s", result)
                 continue
             if result is None:
@@ -1976,6 +1920,117 @@ class TwitchStreamMonitor:
             results[channel_id] = result
 
         return results
+
+    # 配信履歴を追加するコメント
+    def _record_stream_history(self, session: StreamSession, ended_at: float) -> None:
+        """配信履歴をキャッシュに追加する。"""
+
+        # 正常な時刻のみ記録するコメント
+        started_at = session.started_at
+        if ended_at <= started_at:
+            return
+
+        # 新しいレコードを作成するコメント
+        record = {
+            "stream_id": session.stream_id,
+            "started_at": float(started_at),
+            "ended_at": float(ended_at),
+        }
+
+        # 同じIDがあれば置き換えるコメント
+        self._stream_history = [
+            item for item in self._stream_history if item.get("stream_id") != session.stream_id
+        ]
+        self._stream_history.append(record)
+
+        # 古い履歴を削るコメント
+        cutoff = time.time() - 400 * 24 * 60 * 60
+        self._stream_history = [
+            item for item in self._stream_history if item.get("ended_at", 0) >= cutoff
+        ]
+
+        # キャッシュを書き込むコメント
+        self._save_stream_history_cache()
+
+    # 月次配信統計を投稿するコメント
+    async def _maybe_post_monthly_stats(self, now: float) -> None:
+        """月初めに先月の配信統計を投稿する。"""
+
+        # 現在時刻をローカル日時に変換するコメント
+        now_local = datetime.fromtimestamp(now)
+
+        # 月初め以外は処理しないコメント
+        if now_local.day != 1:
+            return
+
+        # 先月の期間を算出するコメント
+        current_month_start = datetime(now_local.year, now_local.month, 1)
+        previous_month_end = current_month_start - timedelta(days=1)
+        previous_month_start = datetime(previous_month_end.year, previous_month_end.month, 1)
+        previous_previous_end = previous_month_start - timedelta(days=1)
+        previous_previous_start = datetime(previous_previous_end.year, previous_previous_end.month, 1)
+        previous_month_key = f"{previous_month_start.year:04d}-{previous_month_start.month:02d}"
+
+        # 既に投稿済みならスキップするコメント
+        if previous_month_key in self._monthly_stats_posted:
+            return
+
+        # 先月の配信統計を計算するコメント
+        start_timestamp = previous_month_start.timestamp()
+        end_timestamp = current_month_start.timestamp()
+        total_days, total_seconds = self._calculate_monthly_stats(start_timestamp, end_timestamp)
+
+        # 先々月の配信統計を計算するコメント
+        prev_start_timestamp = previous_previous_start.timestamp()
+        prev_end_timestamp = previous_month_start.timestamp()
+        prev_days, prev_seconds = self._calculate_monthly_stats(prev_start_timestamp, prev_end_timestamp)
+
+        # 投稿文を作成するコメント
+        message = build_monthly_stats_tweet(
+            start_timestamp=start_timestamp,
+            end_timestamp=end_timestamp,
+            total_days=total_days,
+            total_seconds=total_seconds,
+            diff_days=total_days - prev_days,
+            diff_seconds=total_seconds - prev_seconds,
+        )
+
+        # 投稿をキューに追加するコメント
+        await self._poster.enqueue_text(message)
+        self._monthly_stats_posted.add(previous_month_key)
+        self._save_monthly_stats_cache()
+
+    # 月次配信統計を計算するコメント
+    def _calculate_monthly_stats(self, start_timestamp: float, end_timestamp: float) -> Tuple[int, float]:
+        """指定期間の配信日数と総配信時間を計算する。"""
+
+        # 配信日数を保持するコメント
+        active_days: Set[datetime.date] = set()
+        total_seconds = 0.0
+
+        # 履歴から集計するコメント
+        for item in self._stream_history:
+            started_at = float(item.get("started_at", 0))
+            ended_at = float(item.get("ended_at", 0))
+            if ended_at <= start_timestamp or started_at >= end_timestamp:
+                continue
+
+            # 期間内の重なりを計算するコメント
+            overlap_start = max(started_at, start_timestamp)
+            overlap_end = min(ended_at, end_timestamp)
+            if overlap_end <= overlap_start:
+                continue
+
+            total_seconds += overlap_end - overlap_start
+
+            # 日付単位で配信日数を数えるコメント
+            current_date = datetime.fromtimestamp(overlap_start).date()
+            last_date = datetime.fromtimestamp(max(overlap_start, overlap_end - 1)).date()
+            while current_date <= last_date:
+                active_days.add(current_date)
+                current_date += timedelta(days=1)
+
+        return len(active_days), total_seconds
 
     # YouTube配信予定の告知を投稿するコメント
     async def _post_youtube_upcoming_infos(
@@ -2033,6 +2088,9 @@ class TwitchStreamMonitor:
         upcoming_infos = await self._fetch_youtube_upcoming_infos(now)
         await self._post_youtube_upcoming_infos(upcoming_infos, now)
 
+        # 月次配信統計を必要に応じて投稿するコメント
+        await self._maybe_post_monthly_stats(now)
+
         # 配信中かどうかで処理を分岐するコメント
         if stream_info is None:
             await self._handle_stream_offline(now)
@@ -2089,12 +2147,14 @@ class TwitchStreamMonitor:
                         channel_id=channel_id,
                         video_id=youtube_info.video_id,
                         title=youtube_info.title,
+                        channel_title=youtube_info.channel_title,
                         started_at=youtube_info.started_at,
                         samples=deque(maxlen=self._settings.youtube_sample_max_points),
                     )
                     channel_session = self._session.youtube_channels[channel_id]
                 else:
                     channel_session.title = youtube_info.title
+                    channel_session.channel_title = youtube_info.channel_title
                     channel_session.started_at = youtube_info.started_at
                 channel_session.samples.append(
                     ViewerSample(
@@ -2127,6 +2187,9 @@ class TwitchStreamMonitor:
     async def _post_session_summary(self, session: StreamSession, ended_at: float) -> None:
         """同接グラフとサマリーを投稿キューに追加する。"""
 
+        # 配信履歴を記録するコメント
+        self._record_stream_history(session, ended_at)
+
         # YouTubeの系列データを整形するコメント
         youtube_series: List[Tuple[str, Deque[ViewerSample]]] = []
         youtube_channel_ids = [
@@ -2136,8 +2199,10 @@ class TwitchStreamMonitor:
         ]
         for index, channel_id in enumerate(youtube_channel_ids, start=1):
             channel_session = session.youtube_channels[channel_id]
-            label = "YouTube" if len(youtube_channel_ids) == 1 else f"YouTube{index}"
-            youtube_series.append((label, channel_session.samples))
+            label = channel_session.channel_title or channel_id
+            if not label:
+                label = f"YouTube{index}"
+            youtube_series.append((f"[YouTube]{label}", channel_session.samples))
 
         # グラフ画像を生成するコメント
         graph_path = self._create_graph_path()
@@ -2146,6 +2211,7 @@ class TwitchStreamMonitor:
             graph_path,
             session.title,
             youtube_series if youtube_series else None,
+            twitch_label=f"[Twitch]{self._settings.twitch_channel}",
         )
 
         # 投稿文を作成するコメント
@@ -2210,9 +2276,6 @@ def setup_logging() -> None:
 async def run_bot(settings: Settings) -> None:
     """Botの起動と終了処理を非同期で行う。"""
 
-    # 稼働状況の初期化を行うコメント
-    status = BotStatus(settings.twitch_channel, TARGET_TWITCH_USER_DISPLAY)
-
     # Xクライアントと投稿ワーカーを準備するコメント
     x_client = create_x_client(settings)
     x_media_client = create_x_media_client(settings)
@@ -2221,7 +2284,6 @@ async def run_bot(settings: Settings) -> None:
         media_client=x_media_client,
         interval_seconds=settings.x_post_interval_seconds,
         queue_size=settings.x_queue_size,
-        status=status,
         reply_setting=settings.x_reply_setting,
         reply_mentions=settings.x_reply_mention_users,
     )
@@ -2233,44 +2295,29 @@ async def run_bot(settings: Settings) -> None:
         refresh_token=settings.twitch_refresh_token,
     )
 
-    # ステータスAPIサーバーを準備するコメント
-    status_server = StatusServerController(status)
-
     # Twitchのユーザー名を解決するコメント
     try:
         resolved_nick = await resolve_twitch_nick(settings, token_manager)
     except Exception as exc:
-        status.record_error(f"Twitchユーザー名解決失敗: {exc}")
+        LOGGER.exception("Twitchユーザー名解決に失敗しました: %s", exc)
         raise
 
     # 投稿ワーカーを起動するコメント
     poster.start()
 
-    # 起動投稿を行うコメント
-    await poster.enqueue_text(STARTUP_POST_MESSAGE)
-
     # Twitch IRCリスナーを起動するコメント
-    listener = TwitchIRCListener(settings, poster, token_manager, resolved_nick, status)
+    listener = TwitchIRCListener(settings, poster, token_manager, resolved_nick)
 
     # Twitch配信監視を起動するコメント
-    stream_monitor = TwitchStreamMonitor(settings, poster, token_manager, status)
+    stream_monitor = TwitchStreamMonitor(settings, poster, token_manager)
     stream_monitor.start()
     try:
-        # ステータスAPIを起動するコメント
-        try:
-            status_server.start()
-        except OSError as exc:
-            status.record_error(f"ステータスAPI起動失敗: {exc}")
-            LOGGER.exception("ステータスAPIの起動に失敗しました: %s", exc)
-
         await listener.run()
     finally:
         # クリーンアップ処理を行うコメント
         stream_monitor.stop()
         await stream_monitor.close()
         await poster.close()
-        status.set_status("stopped", "停止済み")
-        status_server.stop()
 
 
 # メイン処理に関するコメント
