@@ -358,8 +358,8 @@
         </div>
         <!-- 説明文を表示するコメント -->
         <p>
-          Twitchコメント監視とX投稿の稼働状況を、ローカルAPIから自動取得して表示するダッシュボードです。
-          APIが停止している場合は未接続として表示されます。
+          Twitchコメント監視とX投稿の稼働状況を、ローカルAPIまたはGitHub Actions更新のJSONから取得して表示します。
+          取得先に接続できない場合は未接続として表示されます。
         </p>
       </header>
 
@@ -386,6 +386,8 @@
           <div>最終更新: <strong id="status-updated">--</strong></div>
           <!-- API接続状態を表示するコメント -->
           <div>API接続: <strong id="api-status">未接続</strong></div>
+          <!-- 更新元を表示するコメント -->
+          <div>更新元: <strong id="data-source">--</strong></div>
           <!-- 現在時刻を表示するコメント -->
           <div>現在時刻: <strong id="now-clock">--</strong></div>
           <!-- 稼働時間を表示するコメント -->
@@ -487,10 +489,28 @@
 
     <!-- 挙動を制御するスクリプトを配置するコメント -->
     <script>
-      // 状態を保存するキーを定義するコメント
+      // 稼働状況の取得先リストを定義するコメント
+      const STATUS_SOURCES = [];
+
+      // ローカル環境かどうかを判定するコメント
+      const isLocalHost = ["localhost", "127.0.0.1"].includes(window.location.hostname);
+
+      // ローカル環境の場合はローカルAPIを優先するコメント
+      if (isLocalHost) {
+        STATUS_SOURCES.push({ name: "ローカルAPI", url: "http://127.0.0.1:8080/status" });
+      }
+
+      // GitHub Pages向けにstatus.jsonを追加するコメント
+      STATUS_SOURCES.push({
+        name: "GitHub Actions",
+        url: new URL("status.json", window.location.href).toString(),
+      });
+
+      // ステータス取得間隔を定義するコメント
+      const STATUS_POLL_INTERVAL_MS = 3000;
+
+      // メモ保存用のキーを定義するコメント
       const STORAGE_KEYS = {
-        status: "xhikakin-status",
-        updated: "xhikakin-status-updated",
         memo: "xhikakin-memo",
       };
 
@@ -499,7 +519,8 @@
         running: { label: "稼働中", hint: "監視と投稿が動作中です。" },
         warning: { label: "注意", hint: "エラーや遅延が発生している可能性があります。" },
         stopped: { label: "停止", hint: "プロセスが停止しています。" },
-        unknown: { label: "未確認", hint: "状態ボタンで更新してください。" },
+        starting: { label: "起動中", hint: "起動処理を進めています。" },
+        unknown: { label: "未確認", hint: "ステータスAPIの応答を待っています。" },
       };
 
       // DOM要素を取得するコメント
@@ -507,14 +528,27 @@
       const statusText = document.getElementById("status-text");
       const statusHint = document.getElementById("status-hint");
       const statusUpdated = document.getElementById("status-updated");
+      const apiStatus = document.getElementById("api-status");
+      const dataSource = document.getElementById("data-source");
       const nowClock = document.getElementById("now-clock");
       const uptime = document.getElementById("uptime");
       const memoField = document.getElementById("memo");
       const memoStatus = document.getElementById("memo-status");
-      const actionButtons = document.querySelectorAll("[data-status]");
+      const twitchChannelValue = document.getElementById("twitch-channel");
+      const targetUserValue = document.getElementById("target-user");
+      const lastCommentUser = document.getElementById("last-comment-user");
+      const lastCommentText = document.getElementById("last-comment-text");
+      const lastCommentTime = document.getElementById("last-comment-time");
+      const lastPostTime = document.getElementById("last-post-time");
+      const lastPostText = document.getElementById("last-post-text");
+      const lastErrorTime = document.getElementById("last-error-time");
+      const lastErrorText = document.getElementById("last-error-text");
 
       // ページが開かれた時刻を記録するコメント
-      const startTime = Date.now();
+      const pageStartTime = Date.now();
+
+      // APIから取得した起動時刻を保持するコメント
+      let apiStartedAt = null;
 
       // 日時を整形する関数に関するコメント
       const formatDateTime = (date) =>
@@ -524,46 +558,109 @@
           date.getMinutes(),
         ).padStart(2, "0")}:${String(date.getSeconds()).padStart(2, "0")}`;
 
-      // 稼働時間を整形する関数に関するコメント
-      const formatUptime = (millis) => {
-        const totalSeconds = Math.floor(millis / 1000);
-        const hours = String(Math.floor(totalSeconds / 3600)).padStart(2, "0");
-        const minutes = String(Math.floor((totalSeconds % 3600) / 60)).padStart(2, "0");
-        const seconds = String(totalSeconds % 60).padStart(2, "0");
-        return `${hours}:${minutes}:${seconds}`;
+      // APIの時刻を整形する関数に関するコメント
+      const formatApiTime = (isoString, epochSeconds) => {
+        if (isoString) {
+          return formatDateTime(new Date(isoString));
+        }
+        if (typeof epochSeconds === "number") {
+          return formatDateTime(new Date(epochSeconds * 1000));
+        }
+        return "--";
       };
 
-      // 状態表示を更新する関数に関するコメント
-      const applyStatus = (statusKey, updatedAt) => {
-        const safeKey = STATUS_MAP[statusKey] ? statusKey : "unknown";
-        const { label, hint } = STATUS_MAP[safeKey];
+      // 稼働時間を整形する関数に関するコメント
+      const formatUptimeSeconds = (seconds) => {
+        const safeSeconds = Math.max(0, Math.floor(seconds));
+        const hours = String(Math.floor(safeSeconds / 3600)).padStart(2, "0");
+        const minutes = String(Math.floor((safeSeconds % 3600) / 60)).padStart(2, "0");
+        const remainder = String(safeSeconds % 60).padStart(2, "0");
+        return `${hours}:${minutes}:${remainder}`;
+      };
+
+      // ステータス表示を更新する関数に関するコメント
+      const applyStatus = (payload) => {
+        const statusKey = STATUS_MAP[payload.status] ? payload.status : "unknown";
+        const { label, hint } = STATUS_MAP[statusKey];
+        const statusMessage = payload.status_message || hint;
 
         statusCard.classList.remove("status-running", "status-warning", "status-stopped");
-        if (safeKey === "running") {
+        if (statusKey === "running") {
           statusCard.classList.add("status-running");
-        } else if (safeKey === "warning") {
+        } else if (statusKey === "warning") {
           statusCard.classList.add("status-warning");
-        } else if (safeKey === "stopped") {
+        } else if (statusKey === "stopped") {
           statusCard.classList.add("status-stopped");
         }
 
         statusText.textContent = label;
-        statusHint.textContent = hint;
-        statusUpdated.textContent = updatedAt ? formatDateTime(new Date(updatedAt)) : "--";
+        statusHint.textContent = statusMessage;
+        statusUpdated.textContent = formatApiTime(
+          payload.status_updated_at_iso,
+          payload.status_updated_at,
+        );
       };
 
-      // ステータスを保存する関数に関するコメント
-      const saveStatus = (statusKey) => {
-        const updatedAt = Date.now();
-        localStorage.setItem(STORAGE_KEYS.status, statusKey);
-        localStorage.setItem(STORAGE_KEYS.updated, String(updatedAt));
-        applyStatus(statusKey, updatedAt);
+      // 詳細情報を反映する関数に関するコメント
+      const applyDetails = (payload) => {
+        twitchChannelValue.textContent = payload.twitch_channel || "--";
+        targetUserValue.textContent = payload.target_user || "--";
+        dataSource.textContent = payload.data_source || dataSource.textContent || "--";
+
+        lastCommentUser.textContent = payload.last_comment_user || "--";
+        lastCommentText.textContent = payload.last_comment_text || "コメント未取得";
+        lastCommentTime.textContent = formatApiTime(
+          payload.last_comment_at_iso,
+          payload.last_comment_at,
+        );
+
+        lastPostTime.textContent = formatApiTime(payload.last_post_at_iso, payload.last_post_at);
+        lastPostText.textContent = payload.last_post_text || "投稿未取得";
+
+        lastErrorTime.textContent = formatApiTime(payload.last_error_at_iso, payload.last_error_at);
+        lastErrorText.textContent = payload.last_error_message || "エラーなし";
+      };
+
+      // API接続状態を更新する関数に関するコメント
+      const updateApiStatus = (isOnline, sourceName) => {
+        apiStatus.textContent = isOnline ? "接続中" : "未接続";
+        if (!isOnline) {
+          dataSource.textContent = "--";
+          return;
+        }
+        dataSource.textContent = sourceName || dataSource.textContent || "--";
+      };
+
+      // APIからステータスを取得する関数に関するコメント
+      const fetchStatus = async () => {
+        for (const source of STATUS_SOURCES) {
+          try {
+            const response = await fetch(source.url, { cache: "no-store" });
+            if (!response.ok) {
+              throw new Error(`status ${response.status}`);
+            }
+            const payload = await response.json();
+            updateApiStatus(true, source.name);
+            applyStatus(payload);
+            applyDetails(payload);
+            if (typeof payload.started_at === "number") {
+              apiStartedAt = payload.started_at * 1000;
+            }
+            return;
+          } catch (error) {
+            // 取得失敗時は次の取得先を試すコメント
+            continue;
+          }
+        }
+        updateApiStatus(false, null);
+        statusHint.textContent = "ステータスAPIに接続できません。";
       };
 
       // 現在時刻と稼働時間を更新する関数に関するコメント
       const updateClocks = () => {
         nowClock.textContent = formatDateTime(new Date());
-        uptime.textContent = formatUptime(Date.now() - startTime);
+        const baseTime = apiStartedAt || pageStartTime;
+        uptime.textContent = formatUptimeSeconds((Date.now() - baseTime) / 1000);
       };
 
       // メモの保存を行う関数に関するコメント
@@ -572,29 +669,12 @@
         memoStatus.textContent = "保存済み";
       };
 
-      // 初期状態を読み込む処理に関するコメント
-      const loadInitialState = () => {
-        const storedStatus = localStorage.getItem(STORAGE_KEYS.status) || "unknown";
-        const storedUpdated = Number(localStorage.getItem(STORAGE_KEYS.updated)) || 0;
+      // メモの初期状態を読み込む処理に関するコメント
+      const loadMemo = () => {
         const storedMemo = localStorage.getItem(STORAGE_KEYS.memo) || "";
-
-        applyStatus(storedStatus, storedUpdated || null);
         memoField.value = storedMemo;
         memoStatus.textContent = storedMemo ? "保存済み" : "未保存";
       };
-
-      // ボタン操作を紐づけるコメント
-      actionButtons.forEach((button) => {
-        if (!(button instanceof HTMLButtonElement)) {
-          return;
-        }
-        button.addEventListener("click", () => {
-          const status = button.getAttribute("data-status");
-          if (status) {
-            saveStatus(status);
-          }
-        });
-      });
 
       // メモの入力を監視するコメント
       memoField.addEventListener("input", () => {
@@ -605,9 +685,11 @@
       memoField.addEventListener("blur", saveMemo);
 
       // 初期状態を反映するコメント
-      loadInitialState();
+      loadMemo();
       updateClocks();
+      fetchStatus();
       setInterval(updateClocks, 1000);
+      setInterval(fetchStatus, STATUS_POLL_INTERVAL_MS);
     </script>
   </body>
 </html>

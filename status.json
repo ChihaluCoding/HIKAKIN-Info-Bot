@@ -1,0 +1,22 @@
+{
+  "data_source": "github-actions",
+  "status": "running",
+  "status_message": "GitHub Actionsで定期更新中",
+  "status_updated_at": 1767509360,
+  "status_updated_at_iso": "2026-01-04T06:49:20+00:00",
+  "started_at": 1767509360,
+  "started_at_iso": "2026-01-04T06:49:20+00:00",
+  "uptime_seconds": 0,
+  "twitch_channel": "hikakin",
+  "target_user": "HIKAKIN / hikakin",
+  "last_comment_at": null,
+  "last_comment_at_iso": null,
+  "last_comment_user": null,
+  "last_comment_text": null,
+  "last_post_at": null,
+  "last_post_at_iso": null,
+  "last_post_text": null,
+  "last_error_at": null,
+  "last_error_at_iso": null,
+  "last_error_message": null
+}

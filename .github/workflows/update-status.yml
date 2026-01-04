@@ -1,0 +1,60 @@
+# ワークフローの名前を定義するコメント
+name: Update Status JSON
+
+# 実行トリガーを定義するコメント
+on:
+  # 手動実行を許可するコメント
+  workflow_dispatch:
+  # 定期実行を設定するコメント
+  schedule:
+    # 5分ごとに実行するコメント
+    - cron: "*/5 * * * *"
+
+# 権限設定を行うコメント
+permissions:
+  # リポジトリへの書き込み権限を与えるコメント
+  contents: write
+
+# 実行ジョブを定義するコメント
+jobs:
+  # ステータス更新ジョブを定義するコメント
+  update-status:
+    # 実行環境を指定するコメント
+    runs-on: ubuntu-latest
+
+    # ジョブ内のステップを定義するコメント
+    steps:
+      # リポジトリをチェックアウトするコメント
+      - name: リポジトリを取得
+        uses: actions/checkout@v4
+
+      # Pythonをセットアップするコメント
+      - name: Pythonをセットアップ
+        uses: actions/setup-python@v5
+        with:
+          # 利用するPythonバージョンを指定するコメント
+          python-version: "3.12"
+
+      # status.jsonを更新するコメント
+      - name: status.jsonを更新
+        run: |
+          # 更新スクリプトを実行するコメント
+          python scripts/update_status_json.py
+
+      # 変更がある場合にコミットしてpushするコメント
+      - name: 変更をコミットしてpush
+        run: |
+          # 差分がない場合は終了するコメント
+          if git diff --quiet; then
+            echo "変更なし"
+            exit 0
+          fi
+          # Gitのユーザー情報を設定するコメント
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          # 変更をステージするコメント
+          git add status.json
+          # コミットするコメント
+          git commit -m "chore: update status.json"
+          # リモートへpushするコメント
+          git push

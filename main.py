@@ -45,6 +45,9 @@ TARGET_TWITCH_USER = "hikakin"
 # 大文字小文字の差を吸収するために小文字化するコメント
 TARGET_TWITCH_USER_LOWER = TARGET_TWITCH_USER.lower()
 
+# 表示用の投稿対象ユーザー名を用意するコメント
+TARGET_TWITCH_USER_DISPLAY = f"{TARGET_TWITCH_USER.upper()} / {TARGET_TWITCH_USER_LOWER}"
+
 # 投稿時の見出しを固定するコメント
 POST_HEADER = "新着コメント😎"
 
@@ -321,6 +324,7 @@ class BotStatus:
         with self._lock:
             now = time.time()
             return {
+                "data_source": "local-api",
                 "status": self._status,
                 "status_message": self._status_message,
                 "status_updated_at": self._status_updated_at,
@@ -903,7 +907,7 @@ async def run_bot(settings: Settings) -> None:
     """Botの起動と終了処理を非同期で行う。"""
 
     # 稼働状況の初期化を行うコメント
-    status = BotStatus(settings.twitch_channel, TARGET_TWITCH_USER)
+    status = BotStatus(settings.twitch_channel, TARGET_TWITCH_USER_DISPLAY)
 
     # Xクライアントと投稿ワーカーを準備するコメント
     x_client = create_x_client(settings)
