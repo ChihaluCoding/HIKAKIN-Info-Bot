@@ -1,0 +1,6 @@
+/.env
+/.venv
+/.vscode
+/AGENTS.md
+/__pycache__
+/requirements.txt
